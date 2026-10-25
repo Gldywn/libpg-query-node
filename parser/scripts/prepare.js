@@ -122,7 +122,9 @@ config.versions.forEach(version => {
       // Update any references to @pgsql/types to use local types
       if (file.endsWith('.js') || file.endsWith('.cjs') || file.endsWith('.d.ts')) {
         let content = fs.readFileSync(destPath, 'utf8');
-        content = content.replace(/@pgsql\/types/g, './types');
+        // Node's ESM resolver rejects directory imports, so ESM files need the full path.
+        const typesPath = file.endsWith('.js') ? './types/index.js' : './types';
+        content = content.replace(/@pgsql\/types/g, typesPath);
         fs.writeFileSync(destPath, content);
       }
     }
