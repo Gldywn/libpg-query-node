@@ -82,11 +82,12 @@ const result = await parse('SELECT * FROM users WHERE active = true');
 
 ### `parseSync(query: string): ParseResult`
 
-Synchronous version that returns the parse tree directly. May throw a parse error.
+Synchronous version that returns the parse tree directly. May throw a parse error. Requires `await loadModule()` (or an async call) first.
 
 ```typescript
-import { parseSync } from 'libpg-query';
+import { loadModule, parseSync } from 'libpg-query';
 
+await loadModule();
 const result = parseSync('SELECT * FROM users WHERE active = true');
 // Returns: ParseResult - parsed query object
 ```
@@ -171,9 +172,9 @@ await loadModule();
 const result = parseSync('SELECT * FROM users');
 ```
 
-### `loadModule(): Promise<void>`
+### `loadModule(options?: LoadModuleOptions): Promise<void>`
 
-Explicitly initializes the WASM module. Required before using any sync methods.
+Explicitly initializes the WASM module. Required before using any sync methods. WASM initialization does not start at import time: the first `loadModule()` or async call starts the initialization.
 
 ```typescript
 import { loadModule, parseSync } from 'libpg-query';
@@ -182,6 +183,23 @@ import { loadModule, parseSync } from 'libpg-query';
 await loadModule();
 const result = parseSync('SELECT * FROM users');
 ```
+
+Both options are optional, and no other key is accepted next to them:
+
+- `instantiateWasm(imports) => Promise<WebAssembly.Instance>`: instantiate the module yourself, for hosts that cannot fetch `libpg-query.wasm` (for example an Electron custom protocol registered without `supportFetchAPI`). A rejection rejects `loadModule()`.
+- `locateFile(path, scriptDirectory) => string`: forwarded to Emscripten, to load `libpg-query.wasm` from another URL. Emscripten does not call it when `instantiateWasm` is given.
+
+```typescript
+import { loadModule } from 'libpg-query';
+
+// wasmBytes: the contents of libpg-query.wasm, bundled with your code
+await loadModule({
+  instantiateWasm: async (imports) =>
+    (await WebAssembly.instantiate(wasmBytes, imports)).instance,
+});
+```
+
+Options are only accepted by the call that starts initialization: after `loadModule()` or an async method has started it, a call that sets `instantiateWasm` or `locateFile` rejects with an `initialization already started` error, while other calls join it. An argument that sets neither hook (for example a test runner's context, as in `before(loadModule)`) counts as no options. A failed load is retried by the next call with the same options, so retry with `loadModule()` (no arguments). The options are also used when the module is rebuilt after a WASM call throws (for example a stack overflow on very deeply nested SQL). `instantiateWasm` therefore runs on every load and must create a new instance from the imports it receives each time: keep the bytes, or a compiled `WebAssembly.Module`, never the instance. A hook that returns an instance it already returned is rejected.
 
 Note: We recommend using async methods as they handle initialization automatically. Use sync methods only when necessary, and always call `loadModule()` first.
 

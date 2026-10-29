@@ -171,7 +171,8 @@ Each PostgreSQL version can be imported directly for better tree-shaking:
 
 Each version export provides:
 - `parse(query: string): Promise<ParseResult>` - Parse a query asynchronously
-- `parseSync(query: string): ParseResult` - Parse a query synchronously (auto-loads if needed)
+- `parseSync(query: string): ParseResult` - Parse a query synchronously (call `await loadModule()` or an async method first; from v18 the module is no longer loaded at import)
+- `loadModule(): Promise<void>` - Load the WASM module
 - `SqlError` - The error class for parsing errors
 - All TypeScript types for that PostgreSQL version
 
@@ -182,7 +183,7 @@ import { parse, parseSync } from '@pgsql/parser/v17';
 // Async parsing
 const result = await parse('SELECT 1');
 
-// Sync parsing (auto-loads on first use)
+// Sync parsing (the module is loaded once parse() or loadModule() has resolved)
 const result2 = parseSync('SELECT 2');
 ```
 

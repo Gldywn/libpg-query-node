@@ -6,8 +6,20 @@
 WASM_OUT_DIR := wasm
 WASM_OUT_NAME := libpg-query
 WASM_MODULE_NAME := PgQueryModule
+
+# WASM memory configuration (bytes). INITIAL_MEMORY is only the floor: the heap
+# grows on demand up to MAXIMUM_MEMORY, so it sets the idle footprint, not the
+# largest input. It must exceed STACK_SIZE + ~2.5MiB of static data. The stack
+# is what prevents deep-recursion traps; keep it at 32MiB.
+WASM_INITIAL_MEMORY ?= 41943040
+WASM_MAXIMUM_MEMORY ?= 1073741824
+WASM_STACK_SIZE ?= 33554432
+
+# libpg_query source, pinned to an exact commit so a release can be rebuilt
+# byte-for-byte. Set in package.json `x-publish` and applied by copy:templates.
 LIBPG_QUERY_REPO := https://github.com/pganalyze/libpg_query.git
 LIBPG_QUERY_TAG := 13-2.2.0
+LIBPG_QUERY_COMMIT := 1097b2c33e54a37c0d2c0f2d498c7d1cf967eae9
 
 CACHE_DIR := .cache
 
@@ -30,7 +42,7 @@ endif
 
 PLATFORM_ARCH := $(PLATFORM)-$(ARCH)
 SRC_FILES := src/wasm_wrapper.c
-LIBPG_QUERY_DIR := $(CACHE_DIR)/$(PLATFORM_ARCH)/libpg_query/$(LIBPG_QUERY_TAG)
+LIBPG_QUERY_DIR := $(CACHE_DIR)/$(PLATFORM_ARCH)/libpg_query/$(LIBPG_QUERY_COMMIT)
 LIBPG_QUERY_ARCHIVE := $(LIBPG_QUERY_DIR)/libpg_query.a
 LIBPG_QUERY_HEADER := $(LIBPG_QUERY_DIR)/pg_query.h
 CXXFLAGS := -O3 -flto
@@ -41,13 +53,17 @@ else
 $(error Native builds are no longer supported. Use EMSCRIPTEN=1 for WASM builds only.)
 endif
 
+# Applied in the same step as the clone, so a failed patch removes the clone.
+ifdef EMSCRIPTEN
+LIBPG_QUERY_PATCH := && patch -d $(LIBPG_QUERY_DIR) -p1 < $(CURDIR)/patches/emscripten_disable_spinlocks.patch
+endif
+
 # Clone libpg_query source (lives in CACHE_DIR) 
 $(LIBPG_QUERY_DIR):
 	mkdir -p $(CACHE_DIR)
-	git clone -b $(LIBPG_QUERY_TAG) --single-branch $(LIBPG_QUERY_REPO) $(LIBPG_QUERY_DIR)
-ifdef EMSCRIPTEN
-	cd $(LIBPG_QUERY_DIR); patch -p1 < $(shell pwd)/patches/emscripten_disable_spinlocks.patch
-endif
+	git clone -b $(LIBPG_QUERY_TAG) --single-branch $(LIBPG_QUERY_REPO) $(LIBPG_QUERY_DIR) && \
+	  git -C $(LIBPG_QUERY_DIR) -c advice.detachedHead=false checkout $(LIBPG_QUERY_COMMIT) $(LIBPG_QUERY_PATCH) || \
+	  { rm -rf $(LIBPG_QUERY_DIR); exit 1; }
 	
 $(LIBPG_QUERY_HEADER): $(LIBPG_QUERY_DIR)
 
@@ -74,9 +90,9 @@ ifdef EMSCRIPTEN
 		-sMODULARIZE=1 \
 		-sEXPORT_ES6=0 \
 		-sALLOW_MEMORY_GROWTH=1 \
-		-sINITIAL_MEMORY=134217728 \
-		-sMAXIMUM_MEMORY=1073741824 \
-        -sSTACK_SIZE=33554432 \
+		-sINITIAL_MEMORY=$(WASM_INITIAL_MEMORY) \
+		-sMAXIMUM_MEMORY=$(WASM_MAXIMUM_MEMORY) \
+        -sSTACK_SIZE=$(WASM_STACK_SIZE) \
 		-lpg_query \
 		-o $@ \
 		$(SRC_FILES)

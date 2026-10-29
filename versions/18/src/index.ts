@@ -141,25 +141,163 @@ interface WasmModule {
   HEAPU8: Uint8Array;
 }
 
+// Structural stand-ins for WebAssembly.Imports/Instance, which only the dom/webworker libs declare;
+// `any` keeps `imports` assignable to WebAssembly.Imports when a hook passes it to WebAssembly.instantiate.
+type WasmImports = Record<string, Record<string, any>>;
+type WasmInstance = { readonly exports: object };
+
+export interface LoadModuleOptions {
+  /** For hosts that cannot fetch the .wasm. Runs on every load, retries and rebuilds included,
+   *  so it must resolve with a new instance each time; a rejection rejects loadModule(). */
+  instantiateWasm?: (imports: WasmImports) => Promise<WasmInstance>;
+  /** Forwarded to Emscripten unchanged. */
+  locateFile?: (path: string, scriptDirectory: string) => string;
+}
+
 let wasmModule: WasmModule;
 
-const initPromise = PgQueryModule().then((module: WasmModule) => {
-  wasmModule = module;
-});
+// After a WASM call throws, the instance is stale: async calls wait for its
+// replacement, while sync calls, which cannot wait, keep using it until the
+// replacement is ready. One replacement loads at a time; the next call retries
+// a failed load.
+let stale = false;
+let loading: Promise<void> | undefined;
+// Counts WASM calls that threw, so cleanup skips an instance that threw mid-call.
+let failures = 0;
+// Sync calls stop using a stale instance after this many failures on it: past
+// about 45, a stack overflow can make the next one spin forever.
+const MAX_STALE_FAILURES = 10;
+let staleFailures = 0;
+// Fixed by the first loadModule() or async call; every load uses them, reloads included.
+let started = false;
+let moduleOptions: LoadModuleOptions = {};
+// A hook that returns an instance it already returned would bring back the one a WASM
+// exception just corrupted, with imports bound to an older module: refuse it loudly.
+const hookInstances = new WeakSet<object>();
+
+function instantiate(): Promise<void> {
+  if (loading) return loading;
+  let startLoad!: () => void;
+  const promise = new Promise<WasmModule>((resolve) => {
+    startLoad = () => resolve(createModule());
+  }).then(
+    (module: WasmModule) => {
+      wasmModule = module;
+      stale = false;
+      staleFailures = 0;
+      loading = undefined;
+    },
+    (error: unknown) => {
+      loading = undefined;
+      throw error;
+    }
+  );
+  loading = promise;
+  // Rejects only for the callers awaiting it.
+  promise.catch(() => {});
+  // Started only now: Emscripten calls locateFile synchronously, and a re-entrant
+  // loadModule() must find `loading` set and join instead of starting another load.
+  startLoad();
+  return promise;
+}
+
+async function createModule(): Promise<WasmModule> {
+  const { instantiateWasm, locateFile } = moduleOptions;
+  const moduleArg: Record<string, unknown> = {};
+  if (locateFile) moduleArg.locateFile = locateFile;
+  if (!instantiateWasm) return PgQueryModule(moduleArg);
+  // Emscripten's instantiateWasm path has no failure callback, so a rejected hook
+  // would leave the factory pending forever: race it against the hook's failure.
+  const hookFailed = new Promise<never>((_, reject) => {
+    moduleArg.instantiateWasm = (
+      imports: WasmImports,
+      receiveInstance: (instance: WasmInstance) => void
+    ) => {
+      Promise.resolve()
+        .then(() => instantiateWasm(imports))
+        .then((instance) => {
+          if (!instance?.exports) {
+            throw new TypeError('libpg-query: instantiateWasm must resolve with a WebAssembly.Instance');
+          }
+          if (hookInstances.has(instance)) {
+            throw new TypeError('libpg-query: instantiateWasm must create a new instance on each call');
+          }
+          hookInstances.add(instance);
+          receiveInstance(instance);
+        })
+        .catch(reject);
+      return {};
+    };
+  });
+  return Promise.race([PgQueryModule(moduleArg), hookFailed]);
+}
+
+// An exception out of a WASM call (V8 stack overflow on deeply nested SQL, a
+// trap, or exit() once the heap limit is hit) skips libpg_query's cleanup and
+// leaves the instance corrupt, so replace it with a fresh one.
+function callWasm(fn: () => number): number {
+  const proc = (globalThis as any).process;
+  const exitCode = proc?.exitCode;
+  try {
+    return fn();
+  } catch (error) {
+    failures++;
+    stale = true;
+    if (++staleFailures >= MAX_STALE_FAILURES) wasmModule = undefined;
+    instantiate();
+    if (proc) proc.exitCode = exitCode;
+    if (error instanceof Error) throw error;
+    const reason = typeof error === 'object' && error !== null
+      ? ((error as any).message ?? (error as any).constructor?.name)
+      : error;
+    throw new Error(
+      `libpg_query terminated (${reason}), most likely out of WASM memory; parse large inputs in smaller pieces`,
+      { cause: error }
+    );
+  }
+}
 
 function ensureLoaded() {
   if (!wasmModule) throw new Error("WASM module not initialized. Call `loadModule()` first.");
 }
 
+/** Options are only accepted by the call that starts initialization; later calls without options join it. */
+export function loadModule(): Promise<void>;
+// Listed first so `before(loadModule)` or `.then(loadModule)` still type-check, as with 18.1.5.
+export function loadModule(options?: LoadModuleOptions): Promise<void>;
+// No declared parameter, as in 18.1.5: test runners inspect a hook's arity and source and pass it
+// their own context, so only an argument that sets a hook counts as options.
 export async function loadModule(): Promise<void> {
-  if (!wasmModule) {
-    await initPromise;
+  const options = arguments[0];
+  // Read by name once (prototype hooks count), before the state check, so a getter that calls
+  // loadModule() starts the initialization and the outer call is then rejected as late.
+  const { instantiateWasm, locateFile } = Object(options);
+  const hasOptions = instantiateWasm !== undefined || locateFile !== undefined;
+  if (hasOptions) {
+    for (const key of Object.keys(options)) {
+      if (key !== 'instantiateWasm' && key !== 'locateFile') {
+        throw new TypeError(`libpg-query: unknown loadModule() option "${key}"`);
+      }
+    }
+    for (const [key, value] of Object.entries({ instantiateWasm, locateFile })) {
+      if (value !== undefined && typeof value !== 'function') {
+        throw new TypeError(`libpg-query: loadModule() option "${key}" must be a function`);
+      }
+    }
+    if (started) {
+      throw new Error('libpg-query: initialization already started; pass loadModule() options to the first call');
+    }
+    moduleOptions = { instantiateWasm, locateFile };
   }
+  started = true;
+  while (!wasmModule || stale) await instantiate();
 }
 
 function awaitInit<T extends (...args: any[]) => Promise<any>>(fn: T): T {
   return (async (...args: Parameters<T>) => {
-    await initPromise;
+    started = true;
+    // Re-checked after every await: another call may have failed in between.
+    while (!wasmModule || stale) await instantiate();
     return fn(...args);
   }) as T;
 }
@@ -207,10 +345,11 @@ export const parse = awaitInit(async (query: string): Promise<ParseResult> => {
   }
 
   const queryPtr = stringToPtr(query);
+  const failuresBefore = failures;
   let resultPtr = 0;
   
   try {
-    resultPtr = wasmModule._wasm_parse_query_raw(queryPtr);
+    resultPtr = callWasm(() => wasmModule._wasm_parse_query_raw(queryPtr));
     if (!resultPtr) {
       throw new Error('Failed to parse query: memory allocation failed');
     }
@@ -242,25 +381,28 @@ export const parse = awaitInit(async (query: string): Promise<ParseResult> => {
     }
     
     if (!parseTreePtr) {
-      throw new Error('No parse tree generated');
+      throw new Error('libpg_query returned no parse tree: out of WASM memory (heap limit is WASM_MAXIMUM_MEMORY, 1 GiB); parse large inputs in smaller pieces');
     }
     
     const parseTreeStr = wasmModule.UTF8ToString(parseTreePtr);
     return JSON.parse(parseTreeStr);
   } finally {
-    wasmModule._free(queryPtr);
-    if (resultPtr) {
-      wasmModule._wasm_free_parse_result(resultPtr);
+    if (failures === failuresBefore) {
+      wasmModule._free(queryPtr);
+      if (resultPtr) {
+        wasmModule._wasm_free_parse_result(resultPtr);
+      }
     }
   }
 });
 
 export const parsePlPgSQL = awaitInit(async (query: string): Promise<ParseResult> => {
   const queryPtr = stringToPtr(query);
+  const failuresBefore = failures;
   let resultPtr = 0;
   
   try {
-    resultPtr = wasmModule._wasm_parse_plpgsql(queryPtr);
+    resultPtr = callWasm(() => wasmModule._wasm_parse_plpgsql(queryPtr));
     const resultStr = ptrToString(resultPtr);
     
     // Success is always a JSON object; anything else is an error message
@@ -270,19 +412,22 @@ export const parsePlPgSQL = awaitInit(async (query: string): Promise<ParseResult
     
     return JSON.parse(resultStr);
   } finally {
-    wasmModule._free(queryPtr);
-    if (resultPtr) {
-      wasmModule._wasm_free_string(resultPtr);
+    if (failures === failuresBefore) {
+      wasmModule._free(queryPtr);
+      if (resultPtr) {
+        wasmModule._wasm_free_string(resultPtr);
+      }
     }
   }
 });
 
 export const fingerprint = awaitInit(async (query: string): Promise<string> => {
   const queryPtr = stringToPtr(query);
+  const failuresBefore = failures;
   let resultPtr = 0;
   
   try {
-    resultPtr = wasmModule._wasm_fingerprint(queryPtr);
+    resultPtr = callWasm(() => wasmModule._wasm_fingerprint(queryPtr));
     const resultStr = ptrToString(resultPtr);
     
     if (resultStr.startsWith('syntax error') || resultStr.startsWith('deparse error') || resultStr.startsWith('ERROR')) {
@@ -291,19 +436,22 @@ export const fingerprint = awaitInit(async (query: string): Promise<string> => {
     
     return resultStr;
   } finally {
-    wasmModule._free(queryPtr);
-    if (resultPtr) {
-      wasmModule._wasm_free_string(resultPtr);
+    if (failures === failuresBefore) {
+      wasmModule._free(queryPtr);
+      if (resultPtr) {
+        wasmModule._wasm_free_string(resultPtr);
+      }
     }
   }
 });
 
 export const normalize = awaitInit(async (query: string): Promise<string> => {
   const queryPtr = stringToPtr(query);
+  const failuresBefore = failures;
   let resultPtr = 0;
   
   try {
-    resultPtr = wasmModule._wasm_normalize_query(queryPtr);
+    resultPtr = callWasm(() => wasmModule._wasm_normalize_query(queryPtr));
     const resultStr = ptrToString(resultPtr);
     
     if (resultStr.startsWith('syntax error') || resultStr.startsWith('deparse error') || resultStr.startsWith('ERROR')) {
@@ -312,9 +460,11 @@ export const normalize = awaitInit(async (query: string): Promise<string> => {
     
     return resultStr;
   } finally {
-    wasmModule._free(queryPtr);
-    if (resultPtr) {
-      wasmModule._wasm_free_string(resultPtr);
+    if (failures === failuresBefore) {
+      wasmModule._free(queryPtr);
+      if (resultPtr) {
+        wasmModule._wasm_free_string(resultPtr);
+      }
     }
   }
 });
@@ -335,10 +485,11 @@ export function parseSync(query: string): ParseResult {
   }
 
   const queryPtr = stringToPtr(query);
+  const failuresBefore = failures;
   let resultPtr = 0;
   
   try {
-    resultPtr = wasmModule._wasm_parse_query_raw(queryPtr);
+    resultPtr = callWasm(() => wasmModule._wasm_parse_query_raw(queryPtr));
     if (!resultPtr) {
       throw new Error('Failed to parse query: memory allocation failed');
     }
@@ -370,15 +521,17 @@ export function parseSync(query: string): ParseResult {
     }
     
     if (!parseTreePtr) {
-      throw new Error('No parse tree generated');
+      throw new Error('libpg_query returned no parse tree: out of WASM memory (heap limit is WASM_MAXIMUM_MEMORY, 1 GiB); parse large inputs in smaller pieces');
     }
     
     const parseTreeStr = wasmModule.UTF8ToString(parseTreePtr);
     return JSON.parse(parseTreeStr);
   } finally {
-    wasmModule._free(queryPtr);
-    if (resultPtr) {
-      wasmModule._wasm_free_parse_result(resultPtr);
+    if (failures === failuresBefore) {
+      wasmModule._free(queryPtr);
+      if (resultPtr) {
+        wasmModule._wasm_free_parse_result(resultPtr);
+      }
     }
   }
 }
@@ -388,10 +541,11 @@ export function parsePlPgSQLSync(query: string): ParseResult {
     throw new Error('WASM module not initialized. Call loadModule() first.');
   }
   const queryPtr = stringToPtr(query);
+  const failuresBefore = failures;
   let resultPtr = 0;
   
   try {
-    resultPtr = wasmModule._wasm_parse_plpgsql(queryPtr);
+    resultPtr = callWasm(() => wasmModule._wasm_parse_plpgsql(queryPtr));
     const resultStr = ptrToString(resultPtr);
     
     // Success is always a JSON object; anything else is an error message
@@ -401,9 +555,11 @@ export function parsePlPgSQLSync(query: string): ParseResult {
     
     return JSON.parse(resultStr);
   } finally {
-    wasmModule._free(queryPtr);
-    if (resultPtr) {
-      wasmModule._wasm_free_string(resultPtr);
+    if (failures === failuresBefore) {
+      wasmModule._free(queryPtr);
+      if (resultPtr) {
+        wasmModule._wasm_free_string(resultPtr);
+      }
     }
   }
 }
@@ -413,10 +569,11 @@ export function fingerprintSync(query: string): string {
     throw new Error('WASM module not initialized. Call loadModule() first.');
   }
   const queryPtr = stringToPtr(query);
+  const failuresBefore = failures;
   let resultPtr = 0;
   
   try {
-    resultPtr = wasmModule._wasm_fingerprint(queryPtr);
+    resultPtr = callWasm(() => wasmModule._wasm_fingerprint(queryPtr));
     const resultStr = ptrToString(resultPtr);
     
     if (resultStr.startsWith('syntax error') || resultStr.startsWith('deparse error') || resultStr.startsWith('ERROR')) {
@@ -425,9 +582,11 @@ export function fingerprintSync(query: string): string {
     
     return resultStr;
   } finally {
-    wasmModule._free(queryPtr);
-    if (resultPtr) {
-      wasmModule._wasm_free_string(resultPtr);
+    if (failures === failuresBefore) {
+      wasmModule._free(queryPtr);
+      if (resultPtr) {
+        wasmModule._wasm_free_string(resultPtr);
+      }
     }
   }
 }
@@ -437,10 +596,11 @@ export function normalizeSync(query: string): string {
     throw new Error('WASM module not initialized. Call loadModule() first.');
   }
   const queryPtr = stringToPtr(query);
+  const failuresBefore = failures;
   let resultPtr = 0;
   
   try {
-    resultPtr = wasmModule._wasm_normalize_query(queryPtr);
+    resultPtr = callWasm(() => wasmModule._wasm_normalize_query(queryPtr));
     const resultStr = ptrToString(resultPtr);
     
     if (resultStr.startsWith('syntax error') || resultStr.startsWith('deparse error') || resultStr.startsWith('ERROR')) {
@@ -449,19 +609,22 @@ export function normalizeSync(query: string): string {
     
     return resultStr;
   } finally {
-    wasmModule._free(queryPtr);
-    if (resultPtr) {
-      wasmModule._wasm_free_string(resultPtr);
+    if (failures === failuresBefore) {
+      wasmModule._free(queryPtr);
+      if (resultPtr) {
+        wasmModule._wasm_free_string(resultPtr);
+      }
     }
   }
 }
 
 export const scan = awaitInit(async (query: string): Promise<ScanResult> => {
   const queryPtr = stringToPtr(query);
+  const failuresBefore = failures;
   let resultPtr = 0;
   
   try {
-    resultPtr = wasmModule._wasm_scan(queryPtr);
+    resultPtr = callWasm(() => wasmModule._wasm_scan(queryPtr));
     const resultStr = ptrToString(resultPtr);
     
     if (resultStr.startsWith('syntax error') || resultStr.startsWith('deparse error') || resultStr.startsWith('ERROR')) {
@@ -470,9 +633,11 @@ export const scan = awaitInit(async (query: string): Promise<ScanResult> => {
     
     return JSON.parse(resultStr);
   } finally {
-    wasmModule._free(queryPtr);
-    if (resultPtr) {
-      wasmModule._wasm_free_string(resultPtr);
+    if (failures === failuresBefore) {
+      wasmModule._free(queryPtr);
+      if (resultPtr) {
+        wasmModule._wasm_free_string(resultPtr);
+      }
     }
   }
 });
@@ -482,10 +647,11 @@ export function scanSync(query: string): ScanResult {
     throw new Error('WASM module not initialized. Call loadModule() first.');
   }
   const queryPtr = stringToPtr(query);
+  const failuresBefore = failures;
   let resultPtr = 0;
   
   try {
-    resultPtr = wasmModule._wasm_scan(queryPtr);
+    resultPtr = callWasm(() => wasmModule._wasm_scan(queryPtr));
     const resultStr = ptrToString(resultPtr);
     
     if (resultStr.startsWith('syntax error') || resultStr.startsWith('deparse error') || resultStr.startsWith('ERROR')) {
@@ -494,9 +660,11 @@ export function scanSync(query: string): ScanResult {
     
     return JSON.parse(resultStr);
   } finally {
-    wasmModule._free(queryPtr);
-    if (resultPtr) {
-      wasmModule._wasm_free_string(resultPtr);
+    if (failures === failuresBefore) {
+      wasmModule._free(queryPtr);
+      if (resultPtr) {
+        wasmModule._wasm_free_string(resultPtr);
+      }
     }
   }
 } 

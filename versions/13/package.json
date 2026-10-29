@@ -1,6 +1,6 @@
 {
   "name": "@libpg-query/v13",
-  "version": "13.7.3",
+  "version": "13.8.1",
   "description": "The real PostgreSQL query parser",
   "homepage": "https://github.com/constructive-io/libpg-query-node",
   "main": "./wasm/index.cjs",
@@ -13,7 +13,9 @@
     "publishName": "libpg-query",
     "pgVersion": "13",
     "distTag": "pg13",
-    "libpgQueryTag": "13-2.2.0"
+    "libpgQueryRepo": "https://github.com/pganalyze/libpg_query.git",
+    "libpgQueryTag": "13-2.2.0",
+    "libpgQueryCommit": "1097b2c33e54a37c0d2c0f2d498c7d1cf967eae9"
   },
   "files": [
     "wasm/*"
@@ -23,12 +25,12 @@
     "build:js": "node scripts/build.js",
     "build": "pnpm clean && pnpm wasm:build && pnpm build:js",
     "publish:pkg": "node ../../scripts/publish-single-version.js",
-    "wasm:make": "docker run --rm -v $(pwd):/src -u $(id -u):$(id -g) -e EMSCRIPTEN=1 emscripten/emsdk emmake make",
+    "wasm:make": "docker run --rm -v $(pwd):/src -u $(id -u):$(id -g) -e EMSCRIPTEN=1 emscripten/emsdk:6.0.3 emmake make",
     "wasm:build": "pnpm wasm:make build",
     "wasm:rebuild": "pnpm wasm:make rebuild",
     "wasm:clean": "pnpm wasm:make clean",
     "wasm:clean-cache": "pnpm wasm:make clean-cache",
-    "test": "node --test test/parsing.test.js test/errors.test.js test/input-encoding.test.js"
+    "test": "node --test test/parsing.test.js test/errors.test.js test/input-encoding.test.js test/wasm-recovery.test.js"
   },
   "author": "Constructive <developers@constructive.io>",
   "license": "MIT",
